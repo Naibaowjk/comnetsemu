@@ -42,7 +42,7 @@ APP_INSTANCE_NAME = "multi_hop_api_app"
 CLIENT_IP = "10.0.1.11"
 SERVER_IP = "10.0.3.11"
 SERVER_UDP_PORT = 9999
-
+url = 'http://127.0.0.1:8080/mactable/{dpid}'
 
 
 
@@ -187,14 +187,14 @@ class MultiHopRest(app_manager.RyuApp):
         if dst in self.mac_to_port[dpid]: 
             # TODO: recode, here just let it work
             out_port = self.mac_to_port[dpid][dst]  
-            # here to deside if recode 
-            self.logger.info(f'[naibao]: packet can forward, judge recode, current dpid:{dpid}')
-            # true, need to recode
-            if self.recode_node_list[dpid-1] and in_port != vnf_out_port and ip:
-                self.logger.info(f'[naibao]: {dpid} need to recode')
-                out_port= vnf_out_port
-            else :
-                out_port = self.mac_to_port[dpid][dst]            
+            # # here to deside if recode 
+            # self.logger.info(f'[naibao]: packet can forward, judge recode, current dpid:{dpid}')
+            # # true, need to recode
+            # if self.recode_node_list[dpid-1] and in_port != vnf_out_port and ip:
+            #     self.logger.info(f'[naibao]: {dpid} need to recode')
+            #     out_port= vnf_out_port
+            # else :
+            #     out_port = self.mac_to_port[dpid][dst]            
         # ---------------------------
         else:
             out_port = ofproto.OFPP_FLOOD
@@ -305,6 +305,32 @@ class MultiHopRest(app_manager.RyuApp):
         )
         datapath.send_msg(out)
 
+    def set_mac_to_port(self, dpid, entry):
+        mac_table = self.mac_to_port.setdefault(dpid, {})
+        datapath = self.switches.get(dpid)
+
+        entry_port = entry['port']
+        entry_mac = entry['mac']
+
+        if datapath is not None:
+            parser = datapath.ofproto_parser
+            if entry_port not in mac_table.values():
+
+                for mac, port in mac_table.items():
+
+                    # from known device to new device
+                    actions = [parser.OFPActionOutput(entry_port)]
+                    match = parser.OFPMatch(in_port=port, eth_dst=entry_mac)
+                    self.add_flow(datapath, 1, match, actions)
+
+                    # from new device to known device
+                    actions = [parser.OFPActionOutput(port)]
+                    match = parser.OFPMatch(in_port=entry_port, eth_dst=mac)
+                    self.add_flow(datapath, 1, match, actions)
+
+                mac_table.update({entry_mac: entry_port})
+        return mac_table
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         # If you hit this you might want to increase
@@ -378,3 +404,23 @@ class MultiHopController(ControllerBase):
     def list_ip_table(self, req, **kwargs):
         body = json.dumps(list(self.multi_hop_api_app.ip_to_port.items()))
         return Response(content_type="application/json", body=body)
+
+    @route('topology', url, methods=['PUT'],requirements={'dpid': dpid_lib.DPID_PATTERN})
+    def put_mac_table(self, req, **kwargs):
+
+        multi_hop_api_app = self.multi_hop_api_app
+        dpid = dpid_lib.str_to_dpid(kwargs['dpid'])
+        try:
+            new_entry = req.json if req.body else {}
+        except ValueError:
+            raise Response(status=400)
+
+        if dpid not in multi_hop_api_app.mac_to_port:
+            return Response(status=404)
+
+        try:
+            mac_table = multi_hop_api_app.set_mac_to_port(dpid, new_entry)
+            body = json.dumps(mac_table)
+            return Response(content_type='application/json', body=body)
+        except Exception as e:
+            return Response(status=500)
