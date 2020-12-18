@@ -50,7 +50,7 @@ SERVER_UDP_PORT = 9999
 # set a new arg for recode_node
 # First setting default recode_node_list
 
-is_recoded=False
+
 # CONF=cfg.CONF
 # CONF.register_cli_opts([cfg.StrOpt('recode_node', default='[0,0,0]',
 #          help='recode_node for switch')],group='test-switch') 
@@ -71,6 +71,7 @@ class MultiHopRest(app_manager.RyuApp):
         # Map specific interface names to port.
         self.vnf_iface_to_port = {} 
         # read recode_node from recode_node.temp
+        self.is_recoded=False
         self.recode_node_list=[0,0,0]
         re_temp=open("recode_node.temp","r+")
         s1=re_temp.read()
@@ -166,6 +167,7 @@ class MultiHopRest(app_manager.RyuApp):
         eth = pkt.get_protocol(packet_lib.ethernet.ethernet)
         dst = eth.dst
         src = eth.src
+        vnf_out_port = self.vnf_iface_to_port[datapath.id]
 
         self.mac_to_port.setdefault(dpid, {})
 
@@ -179,25 +181,20 @@ class MultiHopRest(app_manager.RyuApp):
             )
 
         self.mac_to_port[dpid][src] = in_port
+        
 
-
-        if dst in self.mac_to_port[dpid]:  
-            global is_recoded        
+        #-----   handle recode -------
+        if dst in self.mac_to_port[dpid]: 
+            # TODO: recode, here just let it work
+            out_port = self.mac_to_port[dpid][dst]  
             # here to deside if recode 
             self.logger.info(f'[naibao]: packet can forward, judge recode, current dpid:{dpid}')
             # true, need to recode
-            if self.recode_node_list[dpid-1]:
+            if self.recode_node_list[dpid-1] and in_port != vnf_out_port and ip:
                 self.logger.info(f'[naibao]: {dpid} need to recode')
-                # judge if recoded
-                if is_recoded:
-                    self.logger.info('[naibao]: already recoded')
-                    out_port = self.mac_to_port[dpid][dst]
-                    is_recoded = False
-                else:
-                    self.logger.info('[naibao]: not recoded, sent to controller to recode')
-                    out_port = ofproto.OFPP_CONTROLLER     
+                out_port= vnf_out_port
             else :
-                    out_port = self.mac_to_port[dpid][dst]          
+                out_port = self.mac_to_port[dpid][dst]            
         # ---------------------------
         else:
             out_port = ofproto.OFPP_FLOOD
@@ -265,16 +262,20 @@ class MultiHopRest(app_manager.RyuApp):
 
         # --- Handle upstream flows.
         vnf_out_port = self.vnf_iface_to_port[datapath.id]
-        if in_port == vnf_out_port:
-            out_port = self.mac_to_port[dpid].get(eth.dst, None)
-            if not out_port:
-                self.logger.error(
-                    f"Can not find the output port of upstream UDP flows for vnf port of datapath {datapath.id}"
-                )
-                return
+        # --- judge if need recode 
+        if self.recode_node_list[dpid-1]:           
+            if in_port == vnf_out_port:
+                out_port = self.mac_to_port[dpid].get(eth.dst, None)
+                if not out_port:
+                    self.logger.error(
+                        f"Can not find the output port of upstream UDP flows for vnf port of datapath {datapath.id}"
+                    )
+                    return
+                actions = [parser.OFPActionOutput(out_port)]
+            else:
+                actions = [parser.OFPActionOutput(vnf_out_port)]
+        else: 
             actions = [parser.OFPActionOutput(out_port)]
-        else:
-            actions = [parser.OFPActionOutput(vnf_out_port)]
         # Add forwarding rules for these specific UDP flows.
         match = parser.OFPMatch(
             in_port=in_port,
@@ -318,19 +319,19 @@ class MultiHopRest(app_manager.RyuApp):
         dp = msg.datapath
         ofp = dp.ofproto
 
-        # here to recode
-        global is_recoded
-        if msg.reason == ofp.OFPR_ACTION:
-            # TODO recode here
-            self.logger.info('[naibao]: recoding...')
-            is_recoded= True
-            self.logger.info('[naibao]: recode finish')
-            reason = 'Action'
-            self.logger.info('[naibao] received: '
-                      'buffer_id=%x total_len=%d reason=%s '
-                      'table_id=%d match=%s data=%s',
-                      msg.buffer_id, msg.total_len, reason,
-                      msg.table_id, msg.match, msg.data)
+        # # here to recode
+        #  is_recoded
+        # if msg.reason == ofp.OFPR_ACTION:
+        #     # TODO recode here
+        #     self.logger.info('[naibao]: recoding...')
+        #     is_recoded= True
+        #     self.logger.info('[naibao]: recode finish')
+        #     reason = 'Action'
+        #     self.logger.info('[naibao] received: '
+        #               'buffer_id=%x total_len=%d reason=%s '
+        #               'table_id=%d match=%s data=%s',
+        #               msg.buffer_id, msg.total_len, reason,
+        #               msg.table_id, msg.match, msg.data)
             
 
         pkt = packet_lib.packet.Packet(msg.data)
@@ -338,7 +339,7 @@ class MultiHopRest(app_manager.RyuApp):
         arp = pkt.get_protocol(packet_lib.arp.arp)
         ip = pkt.get_protocol(packet_lib.ipv4.ipv4)
         udp = pkt.get_protocol(packet_lib.udp.udp)
-
+        self.logger.info(f'[packet_in_handler]: udp={udp}')
         # Ignore LLDP packets
         if eth.ethertype == packet_lib.ether_types.ETH_TYPE_LLDP:
             return
@@ -346,12 +347,13 @@ class MultiHopRest(app_manager.RyuApp):
         if arp:
             # MARK: If the MAC-based flow is added, all following UDP packets
             # will also be l2 forwarded.
-            self.action_l2fwd(msg, pkt, add_flow=False)
+            self.action_l2fwd(msg, pkt, add_flow=True)
         elif ip:
             if udp:
+                self.logger.info('this is a UDP!!!')
                 self.handle_udp(msg, pkt)
             else:
-                self.action_l2fwd(msg, pkt, add_flow=False)
+                self.action_l2fwd(msg, pkt, add_flow=True)
         else:
             # Ignore other packets.
             return
@@ -373,6 +375,6 @@ class MultiHopController(ControllerBase):
         return Response(content_type="application/json", body=body)
 
     @route("topology", "/iptable", methods=["GET"])
-    def list_mac_table(self, req, **kwargs):
+    def list_ip_table(self, req, **kwargs):
         body = json.dumps(list(self.multi_hop_api_app.ip_to_port.items()))
         return Response(content_type="application/json", body=body)
